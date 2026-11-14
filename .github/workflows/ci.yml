@@ -1,9 +1,13 @@
 name: CI
 
+permissions:
+  contents: write
+
 # 触发条件：所有分支的 push 和 PR 都会触发
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -22,25 +26,34 @@ jobs:
       # 仓库内的构建使用与 Release 相同的签名，以便互相覆盖安装。
       # Fork PR 无法访问 Secrets，因此只做编译检查，不上传 APK。
       - name: Set up signing
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          ONEUIX_SIGNING_BUNDLE: ${{ secrets.ONEUIX_SIGNING_BUNDLE }}
         run: |
-          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
-            echo "::error::Signing secrets are not fully configured"
+          if [ -z "$ONEUIX_SIGNING_BUNDLE" ]; then
+            echo "::error::Missing ONEUIX_SIGNING_BUNDLE repository secret. No APK will be published with an ephemeral debug key."
             exit 1
           fi
           umask 077
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > app/release.keystore
-          {
-            printf 'storeFile=release.keystore\n'
-            printf 'storePassword=%s\n' "$KEYSTORE_PASSWORD"
-            printf 'keyAlias=%s\n' "$KEY_ALIAS"
-            printf 'keyPassword=%s\n' "$KEY_PASSWORD"
-          } > keystore.properties
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          bundle = json.loads(base64.b64decode(os.environ["ONEUIX_SIGNING_BUNDLE"].strip(), validate=True))
+          key_bytes = base64.b64decode(bundle["keystore_base64"], validate=True)
+          password = bundle["password"]
+          alias = bundle["alias"]
+          if not key_bytes or alias != "oneuix" or not password.isascii() or not password.replace("-", "").replace("_", "").isalnum():
+              raise ValueError("Invalid signing bundle")
+          Path("app/release.keystore").write_bytes(key_bytes)
+          Path("keystore.properties").write_text(
+              f"storeFile=release.keystore\nstorePassword={password}\n"
+              f"keyAlias={alias}\nkeyPassword={password}\n",
+              encoding="utf-8"
+          )
+          PY
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
@@ -54,27 +67,20 @@ jobs:
         run: ./gradlew assembleDebug
 
       - name: Verify Debug signature
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
-          EXPECTED_CERT_SHA256: 3cfb2d32db4526e9cce22a0092a7d6819659db433cfec613fed68d44d999682a
+          EXPECTED_CERT_SHA256: 9af27a4151d59f946e24aba5edd2221e005cea77c309d800281c7a0eaea490ca
         run: |
           APK_PATH=app/build/outputs/apk/debug/app-debug.apk
-          if [ -z "$ANDROID_HOME" ]; then
-            echo "::error::ANDROID_HOME is not configured"
-            exit 1
-          fi
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)
-          if [ -z "$APKSIGNER" ]; then
-            echo "::error::apksigner was not found"
-            exit 1
-          fi
+          test -n "$APKSIGNER"
           SIGNATURE_INFO=$("$APKSIGNER" verify --verbose --print-certs "$APK_PATH")
           ACTUAL_CERT_SHA256=$(printf '%s\n' "$SIGNATURE_INFO" | sed -n 's/^.*certificate SHA-256 digest: //p' | head -n 1)
           if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
-            echo "::error::Unexpected signing certificate: $ACTUAL_CERT_SHA256"
+            echo "::error::Unexpected APK signature: $ACTUAL_CERT_SHA256 (expected $EXPECTED_CERT_SHA256)"
             exit 1
           fi
-          echo "Verified signing certificate: $ACTUAL_CERT_SHA256"
+          echo "Verified persistent OneUIX signing certificate: $ACTUAL_CERT_SHA256"
 
       # 重命名 Debug 包
       # github.ref_name: 分支名 (例如 main)
